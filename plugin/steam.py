@@ -19,7 +19,6 @@ STEAM_EXE = "steam.exe"
 
 logger = logging.getLogger(__name__)
 
-# Caché global para iconos por ID
 _icon_cache: Dict[int, Optional[str]] = {}
 
 class Steam:
