@@ -3,7 +3,7 @@ body:
     attributes:
       name: description
       description: >
-        AAA Search and launch you Steam games library!
+       Search and launch you Steam games library!
   - type: input
     attributes:
       name: steam_path
