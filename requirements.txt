@@ -6,4 +6,4 @@ ordered-set==4.1.0
 imageio==2.22.2
 setuptools==78.1.0
 requests==2.32.3
-chardet==5.2.0x2 
+chardet==5.2.0
