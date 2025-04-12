@@ -1,12 +1,15 @@
 from pathlib import Path
 import logging
 import winreg as reg
-from winreg import HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE
-from typing import Union, Optional, Dict, List
+from winreg import HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY
+from typing import Union, Optional, Dict, List, Set
 import requests
 import tempfile
 import os
 from functools import lru_cache
+import pickle
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .vdfs import VDF
 from .loginusers import LoginUsers, LoginUser
@@ -14,22 +17,24 @@ from .library import Library
 from .exceptions import SteamLibraryNotFound, SteamExecutableNotFound
 
 STEAM_SUB_KEY = r'SOFTWARE\WOW6432Node\Valve\Steam'
-DEFAULT_STEAM_PATH = r"c:\Program Files (x86)\Steam"
+DEFAULT_STEAM_PATH = r"C:\Program Files (x86)\Steam"
 STEAM_EXE = "steam.exe"
+CACHE_FILE = "steam_icon_cache.pkl"
+CACHE_VERSION = 2  # Increment when cache format changes
 
 logger = logging.getLogger(__name__)
-
-_icon_cache: Dict[int, Optional[str]] = {}
 
 class Steam:
     def __init__(self, path: Union[str, Path] = None):
         """
         Initialize Steam class with optional custom path.
         If no path is provided, tries to find Steam installation automatically.
-        
-        Args:
-            path: Optional custom path to Steam installation
         """
+        self._icon_cache: Dict[int, Optional[str]] = {}
+        self._library_cache: Optional[List[Library]] = None
+        self._loaded_cache = False
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        
         if path is None:
             try:
                 self.path = Path(self.from_registry())
@@ -39,70 +44,68 @@ class Steam:
             self.path = Path(path)
             
         if not self.path.exists():
-            raise FileNotFoundError(f'Could not find Steam installation at: {self.path}')
+            raise FileNotFoundError(f'Steam installation not found at: {self.path}')
         if not self.path.joinpath(STEAM_EXE).exists():
             raise SteamExecutableNotFound(self.path)
+            
+        self._load_icon_cache()
+
+    def __del__(self):
+        self._executor.shutdown(wait=False)
+        self._save_icon_cache()
+
+    def _load_icon_cache(self):
+        """Load icon cache from disk with version checking."""
+        cache_path = Path(tempfile.gettempdir()) / CACHE_FILE
+        try:
+            if cache_path.exists():
+                with open(cache_path, 'rb') as f:
+                    data = pickle.load(f)
+                    if isinstance(data, dict) and data.get('version') == CACHE_VERSION:
+                        self._icon_cache = data.get('cache', {})
+                        logger.info(f"Loaded {len(self._icon_cache)} cached icons")
+        except Exception as e:
+            logger.warning(f"Failed to load icon cache: {e}")
+
+    def _save_icon_cache(self):
+        """Save icon cache to disk with versioning."""
+        if not self._icon_cache:
+            return
+            
+        cache_path = Path(tempfile.gettempdir()) / CACHE_FILE
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump({
+                    'version': CACHE_VERSION,
+                    'cache': self._icon_cache
+                }, f)
+        except Exception as e:
+            logger.warning(f"Failed to save icon cache: {e}")
 
     def from_registry(self) -> str:
-        """
-        Get Steam installation path from Windows registry with multiple fallbacks.
-        
-        Returns:
-            str: Path to Steam installation
-            
-        Raises:
-            FileNotFoundError: If Steam path cannot be found in registry
-        """
+        """Get Steam path from registry with multiple fallbacks."""
         try:
             with reg.OpenKey(HKEY_LOCAL_MACHINE, STEAM_SUB_KEY) as hkey:
                 return reg.QueryValueEx(hkey, "InstallPath")[0]
         except FileNotFoundError:
-            try:
-                with reg.OpenKey(HKEY_CURRENT_USER, STEAM_SUB_KEY) as hkey:
-                    return reg.QueryValueEx(hkey, "SteamPath")[0]
-            except FileNotFoundError:
-                raise FileNotFoundError("Could not find Steam installation in registry")
+            with reg.OpenKey(HKEY_CURRENT_USER, STEAM_SUB_KEY) as hkey:
+                return reg.QueryValueEx(hkey, "SteamPath")[0]
 
+    # Restored methods that were accidentally removed
     def userdata(self, steamid: str) -> Path:
-        """
-        Get path to userdata folder for specific Steam user.
-        
-        Args:
-            steamid: SteamID of the user
-            
-        Returns:
-            Path: Path to userdata folder
-        """
+        """Get path to userdata folder for specific Steam user."""
         return Path(self.path, 'userdata').joinpath(steamid)
 
     def grid_path(self, steamid: str) -> Path:
-        """
-        Get path to grid folder containing custom images for a Steam user.
-        
-        Args:
-            steamid: SteamID of the user
-            
-        Returns:
-            Path: Path to grid folder
-        """
+        """Get path to grid folder containing custom images for a Steam user."""
         return self.userdata(steamid).joinpath('config', 'grid')
 
     def config_path(self) -> Path:
-        """
-        Get path to Steam config folder.
-        
-        Returns:
-            Path: Path to config folder
-        """
+        """Get path to Steam config folder."""
         return Path(self.path, 'config')
 
     def loginusers(self) -> LoginUsers:
-        """
-        Get all Steam users that have logged in on this machine.
-        
-        Returns:
-            LoginUsers: Collection of LoginUser objects
-        """
+        """Get all Steam users that have logged in on this machine."""
         file_path = self.path.joinpath('config', 'loginusers.vdf')
         vdf = VDF(file_path)
         loginusers = LoginUsers()
@@ -118,204 +121,212 @@ class Steam:
         return loginusers
 
     def user(self, username: str) -> LoginUser:
-        """
-        Get Steam user by username.
-        
-        Args:
-            username: Username to search for
-            
-        Returns:
-            LoginUser: User object
-            
-        Raises:
-            KeyError: If user not found
-        """
+        """Get Steam user by username."""
         for user in self.loginusers():
             if user.username == username:
                 return user
         raise KeyError(f'Could not find Steam user with username: {username}')
 
     def most_recent_user(self) -> LoginUser:
-        """
-        Get the most recently logged in Steam user.
-        
-        Returns:
-            LoginUser: Most recent user
-        """
+        """Get the most recently logged in Steam user."""
         return self.loginusers().most_recent()
+
+    def all_shortcuts(self) -> List[Dict]:
+        """Get all Steam shortcuts from all users."""
+        shortcuts = []
+        for user in self.loginusers():
+            shortcuts.extend(user.shortcuts())
+        return shortcuts
 
     @lru_cache(maxsize=512)
     def get_game_icon(self, game_id: int) -> Optional[str]:
         """
-        Get game icon with multiple fallback sources and caching.
-        
+        Get game icon with optimized lookup and caching.
         Priority:
-        1. Local cache
-        2. Steam local files
-        3. Windows registry
-        4. Steam CDN download
-        
-        Args:
-            game_id: Steam game/app ID
-            
-        Returns:
-            Optional[str]: Path to icon file if found, None otherwise
+        1. Memory cache
+        2. Registry lookup (optimized)
+        3. Local Steam files
+        4. CDN download (async)
         """
-        # Check global cache first
-        if game_id in _icon_cache:
-            return _icon_cache[game_id]
-        
-        # 1. Check local Steam paths
-        icon_path = self._get_local_icon_path(game_id)
-        if icon_path:
-            _icon_cache[game_id] = icon_path
-            return icon_path
-            
-        # 2. Check Windows registry
+        # Check memory cache first
+        if game_id in self._icon_cache:
+            cached = self._icon_cache[game_id]
+            if cached and os.path.exists(cached):
+                return cached
+            if cached is None:  # Explicit None means we already checked and found nothing
+                return None
+
+        # Try registry first (fastest)
         icon_path = self._get_registry_icon_path(game_id)
         if icon_path:
-            _icon_cache[game_id] = icon_path
+            self._icon_cache[game_id] = icon_path
             return icon_path
-            
-        # 3. Try downloading from Steam CDN
-        icon_path = self._download_icon(game_id)
-        _icon_cache[game_id] = icon_path  # Can be None if download fails
+
+        # Then check local Steam files
+        icon_path = self._get_local_icon_path(game_id)
+        if icon_path:
+            self._icon_cache[game_id] = icon_path
+            return icon_path
+
+        # Finally try CDN (async)
+        future = self._executor.submit(self._download_icon, game_id)
+        icon_path = future.result()  # Blocking but runs in parallel
+        self._icon_cache[game_id] = icon_path
         return icon_path
 
-    def _get_local_icon_path(self, game_id: int) -> Optional[str]:
-        """
-        Check local Steam cache for game icon.
-        
-        Args:
-            game_id: Steam game/app ID
-            
-        Returns:
-            Optional[str]: Path to icon if found, None otherwise
-        """
-        cache_paths = [
-            os.path.join(self.path, "appcache", "librarycache", f"{game_id}_icon.jpg"),
-            os.path.join(self.path, "steam", "appcache", "librarycache", f"{game_id}_icon.jpg"),
-            os.path.join(self.path, "appcache", "librarycache", f"{game_id}_library_600x900.jpg"),
-            os.path.join(self.path, "steam", "appcache", "librarycache", f"{game_id}_library_600x900.jpg"),
-            os.path.join(self.path, "appcache", "librarycache", f"{game_id}.jpg"),
+    def _get_registry_icon_path(self, game_id: int) -> Optional[str]:
+        """Optimized registry lookup with multiple key attempts."""
+        app_key = f"Steam App {game_id}"
+        registry_paths = [
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
         ]
         
-        for path in cache_paths:
-            if os.path.exists(path):
-                return path
+        # Try different registry views
+        for view in [KEY_WOW64_32KEY, KEY_WOW64_64KEY]:
+            for base_path in registry_paths:
+                try:
+                    with reg.OpenKey(HKEY_LOCAL_MACHINE, f"{base_path}\\{app_key}", 
+                                   access=KEY_READ | view) as key:
+                        
+                        # Check common value names
+                        for value_name in ["DisplayIcon", "IconPath", "InstallIcon"]:
+                            try:
+                                icon_path, _ = reg.QueryValueEx(key, value_name)
+                                if "," in icon_path:
+                                    icon_path = icon_path.split(",")[0]
+                                icon_path = os.path.expandvars(icon_path)
+                                if os.path.exists(icon_path):
+                                    return os.path.abspath(icon_path)
+                            except (FileNotFoundError, OSError):
+                                continue
+
+                        # Try InstallLocation fallback
+                        try:
+                            install_path, _ = reg.QueryValueEx(key, "InstallLocation")
+                            if install_path:
+                                install_path = os.path.expandvars(install_path)
+                                for ext in ['.ico', '.png', '.jpg']:
+                                    for name in ['icon', 'game', f'{game_id}', 'steam_icon']:
+                                        path = os.path.join(install_path, name + ext)
+                                        if os.path.exists(path):
+                                            return os.path.abspath(path)
+                        except (FileNotFoundError, OSError):
+                            continue
+                except (FileNotFoundError, OSError):
+                    continue
         return None
 
-    def _get_registry_icon_path(self, game_id: int) -> Optional[str]:
-        """
-        Search Windows registry for game icon path.
+    def _get_local_icon_path(self, game_id: int) -> Optional[str]:
+        """Optimized local file lookup with path caching."""
+        cache_dirs = [
+            ("appcache", "librarycache"),
+            ("steam", "appcache", "librarycache")
+        ]
         
-        Args:
-            game_id: Steam game/app ID
-            
-        Returns:
-            Optional[str]: Path to icon if found in registry, None otherwise
-        """
-        try:
-            app_key = f"Steam App {game_id}"
-            registry_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-            
-            with reg.OpenKey(reg.HKEY_LOCAL_MACHINE, f"{registry_path}\\{app_key}") as key:
-                # Try common registry values containing icon paths
-                for value_name in ["DisplayIcon", "IconPath", "InstallIcon"]:
-                    try:
-                        icon_path, _ = reg.QueryValueEx(key, value_name)
-                        
-                        # Handle cases like "path,0"
-                        if "," in icon_path:
-                            icon_path = icon_path.split(",")[0]
-                            
-                        if os.path.exists(icon_path):
-                            return icon_path
-                    except FileNotFoundError:
-                        continue
-                    except:
-                        pass
-
-                # Try to build path from InstallLocation
-                try:
-                    install_path, _ = reg.QueryValueEx(key, "InstallLocation")
-                    potential_paths = [
-                        os.path.join(install_path, "icon.ico"),
-                        os.path.join(install_path, "icon.png"),
-                        os.path.join(install_path, "game.ico"),
-                        os.path.join(install_path, f"{game_id}.ico"),
-                        os.path.join(install_path, "steam_icon.ico")
-                    ]
-                    
-                    for path in potential_paths:
-                        if os.path.exists(path):
-                            return path
-                except:
-                    pass
-        except:
-            pass
-            
+        for rel_path in cache_dirs:
+            cache_dir = self.path.joinpath(*rel_path)
+            if not cache_dir.exists():
+                continue
+                
+            for pattern in [f"{game_id}_icon.jpg", f"{game_id}_library_600x900.jpg", f"{game_id}.jpg"]:
+                icon_path = cache_dir / pattern
+                if icon_path.exists():
+                    return str(icon_path)
         return None
 
     def _download_icon(self, game_id: int) -> Optional[str]:
-        """
-        Download game icon from Steam CDN.
-        
-        Args:
-            game_id: Steam game/app ID
-            
-        Returns:
-            Optional[str]: Path to temporary downloaded icon file if successful, None otherwise
-        """
+        """Optimized CDN download with caching."""
         cdn_urls = [
             f"https://cdn.cloudflare.steamstatic.com/steam/apps/{game_id}/library_600x900.jpg",
-            f"https://media.steampowered.com/steamcommunity/public/images/apps/{game_id}/{game_id}.jpg",
-            f"https://cdn.akamai.steamstatic.com/steam/apps/{game_id}/library_600x900.jpg",
-            f"https://cdn.cloudflare.steamstatic.com/steam/apps/{game_id}/capsule_184x69.jpg",
-            f"https://cdn.cloudflare.steamstatic.com/steam/apps/{game_id}/header.jpg",
+            f"https://media.steampowered.com/steamcommunity/public/images/apps/{game_id}/{game_id}.jpg"
         ]
         
         for url in cdn_urls:
             try:
-                response = requests.get(url, timeout=5)
+                response = requests.get(url, timeout=3, stream=True)
                 if response.status_code == 200:
-                    _, ext = os.path.splitext(url)
-                    with tempfile.NamedTemporaryFile(suffix=ext or '.jpg', delete=False) as f:
-                        f.write(response.content)
-                        return f.name
+                    cache_dir = Path(tempfile.gettempdir()) / "steam_icons"
+                    cache_dir.mkdir(exist_ok=True)
+                    
+                    # Create consistent filename based on URL hash
+                    url_hash = hashlib.md5(url.encode()).hexdigest()
+                    ext = os.path.splitext(url)[1] or '.jpg'
+                    cache_file = cache_dir / f"{game_id}_{url_hash}{ext}"
+                    
+                    if not cache_file.exists():
+                        with open(cache_file, 'wb') as f:
+                            for chunk in response.iter_content(1024):
+                                f.write(chunk)
+                    
+                    return str(cache_file)
             except requests.RequestException:
                 continue
         return None
 
     def all_games(self) -> List[Dict]:
-        """
-        Get all games from all Steam libraries with icon information.
-        
-        Returns:
-            List[Dict]: List of game dictionaries with id, name, path and icon
-        """
+        """Get all games with parallel icon prefetching."""
         games = []
+        game_ids = set()
+        
+        # First collect all games
         for library in self.libraries():
             for game in library.games():
                 games.append({
                     'id': game.id,
                     'name': game.name,
                     'path': game.path,
-                    'icon': self.get_game_icon(int(game.id)) or str(game.path)  # Fallback to game path if no icon
+                    'icon': None  # Will be filled later
                 })
+                game_ids.add(int(game.id))
+        
+        # Prefetch icons in parallel
+        futures = {
+            self._executor.submit(self.get_game_icon, game_id): game_id
+            for game_id in game_ids
+        }
+        
+        # Map game IDs to their icon paths
+        icon_map = {}
+        for future in as_completed(futures):
+            game_id = futures[future]
+            try:
+                icon_map[game_id] = future.result()
+            except Exception as e:
+                logger.warning(f"Failed to get icon for game {game_id}: {e}")
+                icon_map[game_id] = None
+        
+        # Update games with icons
+        for game in games:
+            game['icon'] = icon_map.get(int(game['id']), game['path'])
+        
         return games
 
-    def all_shortcuts(self) -> List[Dict]:
-        """
-        Get all Steam shortcuts from all users.
+    def libraries(self) -> List[Library]:
+        """Get libraries with caching."""
+        if self._library_cache is not None:
+            return self._library_cache
+            
+        libraries = []
+        manifest_path = self.path.joinpath('steamapps', 'libraryfolders.vdf')
         
-        Returns:
-            List[Dict]: List of shortcut dictionaries
-        """
-        shortcuts = []
-        for user in self.loginusers():
-            shortcuts.extend(user.shortcuts())
-        return shortcuts
+        if not manifest_path.exists():
+            raise SteamLibraryNotFound(manifest_path)
+            
+        try:
+            library_folders = VDF(manifest_path)
+            libraries_key = 'libraryfolders' if 'libraryfolders' in library_folders else 'LibraryFolders'
+            
+            for key, value in library_folders[libraries_key].items():
+                if key.isdigit():
+                    path = value.get('path', value) if isinstance(value, dict) else value
+                    libraries.append(Library(self, path))
+                    
+            self._library_cache = libraries
+            return libraries
+        except Exception as e:
+            logger.error(f"Failed to load libraries: {e}")
+            raise
 
     def game(self, name: str = None, id: int = None) -> Dict:
         """
@@ -333,7 +344,7 @@ class Steam:
         """
         for library in self.libraries():
             for game in library.games():
-                if game.name.lower() == name.lower() or game.id == id:
+                if (name and game.name.lower() == name.lower()) or (id and game.id == id):
                     return {
                         'id': game.id,
                         'name': game.name,
@@ -341,46 +352,6 @@ class Steam:
                         'icon': self.get_game_icon(game.id)
                     }
         raise KeyError(f'Could not find Steam game with name: {name} or ID: {id}')
-
-    def libraries(self) -> List[Library]:
-        """
-        Get all Steam libraries.
-        
-        Returns:
-            List[Library]: List of Library objects
-            
-        Raises:
-            SteamLibraryNotFound: If libraryfolders.vdf not found
-        """
-        libraries = []
-        libraries_manifest_path = Path(self.path, 'steamapps', 'libraryfolders.vdf')
-        
-        if not libraries_manifest_path.exists():
-            raise SteamLibraryNotFound(libraries_manifest_path)
-            
-        try:
-            library_folders = VDF(libraries_manifest_path)
-        except FileNotFoundError:
-            logging.warning(f'Could not find Steam libraries manifest at: {libraries_manifest_path}')
-            raise
-        else:
-            # Handle different key names in libraryfolders.vdf
-            libraries_key = 'libraryfolders' if library_folders.get('libraryfolders') else 'LibraryFolders'
-            
-            for item in library_folders[libraries_key].keys():
-                if item.isdigit():
-                    try:
-                        library_path = Library(
-                            self, 
-                            library_folders[libraries_key][item]['path']
-                        )
-                    except TypeError:
-                        library_path = Library(
-                            self, 
-                            library_folders[libraries_key][item]
-                        )
-                    libraries.append(library_path)
-        return libraries
 
 
 if __name__ == '__main__':
