@@ -91,7 +91,6 @@ class Steam:
             with reg.OpenKey(HKEY_CURRENT_USER, STEAM_SUB_KEY) as hkey:
                 return reg.QueryValueEx(hkey, "SteamPath")[0]
 
-    # Restored methods that were accidentally removed
     def userdata(self, steamid: str) -> Path:
         """Get path to userdata folder for specific Steam user."""
         return Path(self.path, 'userdata').joinpath(steamid)
@@ -111,7 +110,6 @@ class Steam:
         loginusers = LoginUsers()
         
         for user in vdf['users']:
-            # Handle case where 'MostRecent' is lowercase
             if vdf['users'][user].get('mostrecent'):
                 vdf['users'][user]['MostRecent'] = vdf['users'][user].pop('mostrecent')
                 
@@ -153,7 +151,7 @@ class Steam:
             cached = self._icon_cache[game_id]
             if cached and os.path.exists(cached):
                 return cached
-            if cached is None:  # Explicit None means we already checked and found nothing
+            if cached is None: 
                 return None
 
         # Try registry first (fastest)
@@ -170,7 +168,7 @@ class Steam:
 
         # Finally try CDN (async)
         future = self._executor.submit(self._download_icon, game_id)
-        icon_path = future.result()  # Blocking but runs in parallel
+        icon_path = future.result()  
         self._icon_cache[game_id] = icon_path
         return icon_path
 
@@ -276,7 +274,7 @@ class Steam:
                     'id': game.id,
                     'name': game.name,
                     'path': game.path,
-                    'icon': None  # Will be filled later
+                    'icon': None 
                 })
                 game_ids.add(int(game.id))
         
@@ -355,7 +353,6 @@ class Steam:
 
 
 if __name__ == '__main__':
-    # Example usage
     steam = Steam()
     games = steam.all_games()
     
