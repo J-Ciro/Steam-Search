@@ -2,7 +2,10 @@ from pathlib import Path
 import logging
 import winreg as reg
 from winreg import HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE
-from typing import Union
+from typing import Union, Optional
+import requests
+import tempfile
+import os
 
 from .vdfs import VDF
 from .loginusers import LoginUsers, LoginUser
@@ -34,14 +37,22 @@ class Steam(object):
             raise SteamExecutableNotFound(self.path)
 
     def from_registry(self):
-        with reg.OpenKey(HKEY_LOCAL_MACHINE, STEAM_SUB_KEY) as hkey:
-            return reg.QueryValueEx(hkey, "InstallPath")[0]
+        """Get Steam path from registry with multiple fallbacks"""
+        try:
+            with reg.OpenKey(HKEY_LOCAL_MACHINE, STEAM_SUB_KEY) as hkey:
+                return reg.QueryValueEx(hkey, "InstallPath")[0]
+        except FileNotFoundError:
+            try:
+                with reg.OpenKey(HKEY_CURRENT_USER, STEAM_SUB_KEY) as hkey:
+                    return reg.QueryValueEx(hkey, "SteamPath")[0]
+            except FileNotFoundError:
+                raise FileNotFoundError("Could not find Steam installation in registry")
 
     def userdata(self, steamid: str) -> Path:
         """
         Returns the path to the userdata folder for the steam user.
         """
-        return Path(self.steam_path, 'userdata').joinpath(steamid)
+        return Path(self.path, 'userdata').joinpath(steamid)
 
     def grid_path(self, steamid: str) -> Path:
         return self.userdata(steamid).joinpath('config', 'grid')
@@ -50,7 +61,7 @@ class Steam(object):
         """
         Returns the path to the Steam config folder.
         """
-        return Path(self.steam_path, 'config')
+        return Path(self.path, 'config')
 
     def loginusers(self) -> LoginUsers:
         """
@@ -88,7 +99,12 @@ class Steam(object):
         games = []
         for library in self.libraries():
             for game in library.games():
-                games.append(game)
+                games.append({
+                    'id': game.id,
+                    'name': game.name,
+                    'path': game.path,
+                    'icon': self.get_game_icon(game.id)  # Add icon to game data
+                })
         return games
 
     def all_shortcuts(self) -> list:
@@ -102,14 +118,19 @@ class Steam(object):
             )
         return shortcuts
 
-    def game(self, name: str = None, id: int = None) -> Library:
+    def game(self, name: str = None, id: int = None) -> dict:
         """
-        Returns a Steam game by name or ID.
+        Returns a Steam game by name or ID with icon information.
         """
         for library in self.libraries():
             for game in library.games():
                 if game.name.lower() == name.lower() or game.id == id:
-                    return game
+                    return {
+                        'id': game.id,
+                        'name': game.name,
+                        'path': game.path,
+                        'icon': self.get_game_icon(game.id)
+                    }
         raise KeyError(
             f'Could not find Steam game with name: {name} or ID: {id}')
 
@@ -144,8 +165,82 @@ class Steam(object):
                     libraries.append(library_path)
         return libraries
 
+    def get_game_icon(self, game_id: int) -> Optional[str]:
+        """
+        Get the icon path for a specific game ID.
+        
+        First checks local Steam cache, then falls back to downloading from Steam CDN.
+        
+        Args:
+            game_id: The Steam game/app ID
+            
+        Returns:
+            Path to the icon file if found, None otherwise
+        """
+        # First try local cache
+        icon_path = self._get_local_icon_path(game_id)
+        if icon_path:
+            return icon_path
+            
+        # If not found locally, try to download
+        return self._download_icon(game_id)
+
+    def _get_local_icon_path(self, game_id: int) -> Optional[str]:
+        """
+        Check local Steam cache for game icon.
+        
+        Args:
+            game_id: The Steam game/app ID
+            
+        Returns:
+            Path to the icon file if found, None otherwise
+        """
+        cache_paths = [
+            os.path.join(self.path, "appcache", "librarycache", f"{game_id}_icon.jpg"),
+            os.path.join(self.path, "steam", "appcache", "librarycache", f"{game_id}_icon.jpg"),
+            os.path.join(self.path, "appcache", "librarycache", f"{game_id}_library_600x900.jpg"),
+            os.path.join(self.path, "steam", "appcache", "librarycache", f"{game_id}_library_600x900.jpg"),
+        ]
+        
+        for path in cache_paths:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _download_icon(self, game_id: int) -> Optional[str]:
+        """
+        Download game icon from Steam CDN.
+        
+        Args:
+            game_id: The Steam game/app ID
+            
+        Returns:
+            Path to the downloaded temporary icon file if successful, None otherwise
+        """
+        cdn_urls = [
+            f"https://cdn.cloudflare.steamstatic.com/steam/apps/{game_id}/library_600x900.jpg",
+            f"https://media.steampowered.com/steamcommunity/public/images/apps/{game_id}/{game_id}.jpg",
+            f"https://cdn.akamai.steamstatic.com/steam/apps/{game_id}/library_600x900.jpg",
+        ]
+        
+        for url in cdn_urls:
+            try:
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    # Save to temp file
+                    _, ext = os.path.splitext(url)
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+                        f.write(response.content)
+                        return f.name
+            except requests.RequestException:
+                continue
+        return None
+
 
 if __name__ == '__main__':
     steam = Steam()
-    _ = steam.all_shortcuts()
-    print(_)
+    games = steam.all_games()
+    for game in games:
+        print(f"Game: {game['name']}")
+        print(f"ID: {game['id']}")
+        print(f"Icon: {game['icon']}\n")
