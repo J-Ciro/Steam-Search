@@ -133,3 +133,4 @@ bin/
 *.bat
 *.dist
 *.*build
+/.vs
