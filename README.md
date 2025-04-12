@@ -1,6 +1,9 @@
 ![hero-image](assets/hero.png)
 
 
+# (THIS IS NOT THE OFFICIAL REPO)
+This was made to solve the issue of the Steam-Search plugin not showing the icons
+
 # Steam Search
 Search and launch your Steam Game library
 
