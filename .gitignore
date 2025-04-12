@@ -134,3 +134,4 @@ bin/
 *.dist
 *.*build
 /.vs
+/env4
